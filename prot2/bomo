@@ -1,0 +1,3073 @@
+"""
+Flask web application for semantic segmentation
+"""
+import os
+import sys
+import threading
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask_cors import CORS
+import torch
+
+from config import Config
+from utils import prepare_dataset_info, predict_single_image, save_prediction_results
+from train_model import train_model_background, SegmentationTrainer
+from setup_data import DatasetSetup
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+app.config.from_object(Config)
+
+# Global training state
+training_state = {
+    "is_training": False,
+    "status": "idle",
+    "progress": 0,
+    "current_epoch": 0,
+    "total_epochs": Config.NUM_EPOCHS,
+    "current_loss": 0,
+    "current_iou": 0,
+    "best_iou": 0,
+    "logs": [],
+    "start_time": None,
+    "training_thread": None
+}
+
+# Global model cache
+model_cache = {
+    "model": None,
+    "device": None,
+    "last_loaded": None
+}
+
+def log_message(message: str, level: str = "INFO"):
+    """Add message to training logs"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] [{level}] {message}"
+    
+    training_state["logs"].append(log_entry)
+    
+    # Keep only last 100 logs
+    if len(training_state["logs"]) > 100:
+        training_state["logs"] = training_state["logs"][-100:]
+    
+    print(log_entry)
+
+def get_device():
+    """Get available device"""
+    if Config.USE_GPU and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+def load_model(model_path: str = None):
+    """Load trained model"""
+    try:
+        from utils import SimpleSegmentationModel
+        
+        # Determine which model to load
+        if model_path is None:
+            # Try to load latest model
+            model_path = Path(Config.MODEL_FOLDER) / "latest_model.pth"
+            if not model_path.exists():
+                model_path = Path(Config.MODEL_FOLDER) / "final_model.pth"
+                if not model_path.exists():
+                    return None, "No trained model found"
+        
+        if not os.path.exists(model_path):
+            return None, f"Model file not found: {model_path}"
+        
+        # Initialize model
+        device = get_device()
+        model = SimpleSegmentationModel(num_classes=Config.NUM_CLASSES)
+        
+        # Load weights
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+        
+        # Update cache
+        model_cache["model"] = model
+        model_cache["device"] = device
+        model_cache["last_loaded"] = time.time()
+        
+        log_message(f"Model loaded from {model_path}")
+        return model, None
+        
+    except Exception as e:
+        return None, f"Error loading model: {str(e)}"
+
+def training_callback(status: str, data: Any):
+    """Callback for training updates"""
+    if status == "progress":
+        training_state["progress"] = data.get("progress", 0)
+        training_state["current_epoch"] = data.get("epoch", 0)
+        training_state["current_loss"] = data.get("loss", 0)
+        training_state["current_iou"] = data.get("iou", 0)
+        training_state["best_iou"] = data.get("best_iou", 0)
+        
+        log_message(f"Epoch {data.get('epoch', 0)}: "
+                   f"Loss={data.get('loss', 0):.4f}, "
+                   f"IoU={data.get('iou', 0):.4f}")
+    
+    elif status == "complete":
+        training_state["is_training"] = False
+        training_state["status"] = "completed"
+        training_state["progress"] = 100
+        
+        log_message(f"Training completed! Best IoU: {data.get('best_iou', 0):.4f}")
+        
+        # Load the trained model
+        load_model()
+    
+    elif status == "error":
+        training_state["is_training"] = False
+        training_state["status"] = "error"
+        
+        log_message(f"Training error: {data}", "ERROR")
+
+# Routes
+@app.route('/')
+def index():
+    """Render main page"""
+    return render_template('index.html')
+
+@app.route('/api/dataset/info', methods=['GET'])
+def dataset_info():
+    """Get dataset information"""
+    info = prepare_dataset_info()
+    return jsonify(info)
+
+@app.route('/api/dataset/setup', methods=['POST'])
+def setup_dataset():
+    """Setup dataset"""
+    try:
+        dataset_path = DatasetSetup.setup()
+        
+        if dataset_path:
+            return jsonify({
+                "success": True,
+                "message": f"Dataset setup complete at {dataset_path}",
+                "path": str(dataset_path)
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to setup dataset"
+            }), 400
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }), 500
+
+@app.route('/api/training/status', methods=['GET'])
+def get_training_status():
+    """Get current training status"""
+    # Calculate elapsed time
+    elapsed = None
+    if training_state["start_time"]:
+        elapsed = time.time() - training_state["start_time"]
+    
+    response = {
+        "is_training": training_state["is_training"],
+        "status": training_state["status"],
+        "progress": training_state["progress"],
+        "current_epoch": training_state["current_epoch"],
+        "total_epochs": training_state["total_epochs"],
+        "current_loss": training_state["current_loss"],
+        "current_iou": training_state["current_iou"],
+        "best_iou": training_state["best_iou"],
+        "elapsed_time": elapsed,
+        "logs": training_state["logs"][-20:]  # Last 20 logs
+    }
+    
+    return jsonify(response)
+
+@app.route('/api/training/start', methods=['POST'])
+def start_training():
+    """Start model training"""
+    if training_state["is_training"]:
+        return jsonify({
+            "success": False,
+            "message": "Training already in progress"
+        }), 400
+    
+    try:
+        # Get training parameters
+        data = request.get_json()
+        
+        epochs = data.get('epochs', Config.NUM_EPOCHS)
+        batch_size = data.get('batch_size', Config.BATCH_SIZE)
+        learning_rate = data.get('learning_rate', Config.LEARNING_RATE)
+        
+        # Reset training state
+        training_state.update({
+            "is_training": True,
+            "status": "starting",
+            "progress": 0,
+            "current_epoch": 0,
+            "total_epochs": epochs,
+            "current_loss": 0,
+            "current_iou": 0,
+            "best_iou": 0,
+            "logs": [],
+            "start_time": time.time()
+        })
+        
+        log_message("Starting training...")
+        log_message(f"Parameters: epochs={epochs}, "
+                   f"batch_size={batch_size}, lr={learning_rate}")
+        
+        # Start training in background thread
+        training_params = {
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'learning_rate': learning_rate
+        }
+        
+        def train_thread():
+            try:
+                train_model_background(training_params, training_callback)
+            except Exception as e:
+                training_callback("error", str(e))
+        
+        thread = threading.Thread(target=train_thread)
+        thread.daemon = True
+        thread.start()
+        
+        training_state["training_thread"] = thread
+        
+        return jsonify({
+            "success": True,
+            "message": "Training started successfully"
+        })
+        
+    except Exception as e:
+        training_state["is_training"] = False
+        training_state["status"] = "error"
+        
+        return jsonify({
+            "success": False,
+            "message": f"Error starting training: {str(e)}"
+        }), 500
+
+@app.route('/api/training/stop', methods=['POST'])
+def stop_training():
+    """Stop model training"""
+    if not training_state["is_training"]:
+        return jsonify({
+            "success": False,
+            "message": "No training in progress"
+        }), 400
+    
+    # This is a simple implementation
+    # In production, you'd need a way to gracefully stop the training thread
+    training_state["is_training"] = False
+    training_state["status"] = "stopped"
+    
+    log_message("Training stopped by user")
+    
+    return jsonify({
+        "success": True,
+        "message": "Training stopped"
+    })
+
+@app.route('/api/model/load', methods=['POST'])
+def load_model_endpoint():
+    """Load a trained model"""
+    try:
+        data = request.get_json()
+        model_path = data.get('model_path')
+        
+        model, error = load_model(model_path)
+        
+        if error:
+            return jsonify({
+                "success": False,
+                "message": error
+            }), 400
+        
+        return jsonify({
+            "success": True,
+            "message": "Model loaded successfully"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": f"Error loading model: {str(e)}"
+        }), 500
+
+@app.route('/api/model/predict', methods=['POST'])
+def predict():
+    """Make prediction on uploaded image"""
+    if 'image' not in request.files:
+        return jsonify({
+            "success": False,
+            "message": "No image uploaded"
+        }), 400
+    
+    try:
+        # Get uploaded file
+        image_file = request.files['image']
+        
+        # Save uploaded file
+        upload_dir = Path(Config.UPLOAD_FOLDER)
+        upload_dir.mkdir(exist_ok=True)
+        
+        file_ext = Path(image_file.filename).suffix
+        filename = f"upload_{int(time.time())}{file_ext}"
+        filepath = upload_dir / filename
+        
+        image_file.save(filepath)
+        
+        # Load model if not loaded
+        if model_cache["model"] is None:
+            model, error = load_model()
+            if error:
+                return jsonify({
+                    "success": False,
+                    "message": error
+                }), 400
+        
+        # Make prediction
+        results = predict_single_image(
+            model_cache["model"],
+            filepath,
+            str(model_cache["device"])
+        )
+        
+        # Save results
+        result_files = save_prediction_results(
+            results,
+            Path(filename).stem
+        )
+        
+        # Prepare response
+        response = {
+            "success": True,
+            "message": "Prediction completed",
+            "original_image": result_files["original"],
+            "segmentation": result_files["segmentation"],
+            "blended": result_files["blended"],
+            "mask": result_files["mask"],
+            "detected_classes": results["detected_classes"],
+            "class_ids": results["class_ids"],
+            "class_names": [Config.VOC_CLASSES[i] for i in results["class_ids"] 
+                          if i < len(Config.VOC_CLASSES)]
+        }
+        
+        log_message(f"Prediction completed for {filename}")
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        log_message(f"Prediction error: {str(e)}", "ERROR")
+        return jsonify({
+            "success": False,
+            "message": f"Prediction error: {str(e)}"
+        }), 500
+
+@app.route('/api/model/list', methods=['GET'])
+def list_models():
+    """List available trained models"""
+    model_dir = Path(Config.MODEL_FOLDER)
+    checkpoint_dir = Path("checkpoints")
+    
+    models = []
+    
+    # Check model directory
+    if model_dir.exists():
+        for model_file in model_dir.glob("*.pth"):
+            models.append({
+                "name": model_file.name,
+                "path": str(model_file),
+                "size": model_file.stat().st_size,
+                "type": "model"
+            })
+    
+    # Check checkpoint directory
+    if checkpoint_dir.exists():
+        for checkpoint in checkpoint_dir.glob("*.pth"):
+            models.append({
+                "name": checkpoint.name,
+                "path": str(checkpoint),
+                "size": checkpoint.stat().st_size,
+                "type": "checkpoint"
+            })
+    
+    return jsonify({
+        "success": True,
+        "models": sorted(models, key=lambda x: x["size"], reverse=True)
+    })
+
+@app.route('/static/<path:path>')
+def serve_static(path):
+    """Serve static files"""
+    return send_from_directory('static', path)
+
+@app.route('/api/system/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    health_info = {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "training_active": training_state["is_training"],
+        "model_loaded": model_cache["model"] is not None,
+        "gpu_available": torch.cuda.is_available() if Config.USE_GPU else False,
+        "dataset_ready": DatasetSetup.find_dataset() is not None
+    }
+    
+    return jsonify(health_info)
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        "success": False,
+        "message": "Endpoint not found"
+    }), 404
+
+@app.errorhandler(500)
+def server_error(error):
+    return jsonify({
+        "success": False,
+        "message": "Internal server error"
+    }), 500
+
+# Initialize application
+def init_app():
+    """Initialize the application"""
+    print("=" * 60)
+    print("Semantic Segmentation Web Application")
+    print("=" * 60)
+    
+    # Ensure directories exist
+    Config.ensure_directories()
+    
+    # Try to find dataset
+    dataset_path = DatasetSetup.find_dataset()
+    if dataset_path:
+        print(f"✅ Dataset found at: {dataset_path}")
+    else:
+        print("⚠️  Dataset not found. Use the web interface to download it.")
+    
+    # Try to load existing model
+    model, error = load_model()
+    if model:
+        print("✅ Pre-trained model loaded")
+    else:
+        print(f"ℹ️  No model loaded: {error}")
+    
+    print(f"\n🌐 Starting web server on http://localhost:5000")
+    print("   Press Ctrl+C to stop\n")
+
+if __name__ == '__main__':
+    init_app()
+    app.run(debug=True, host='0.0.0.0', port=5000)"""
+Configuration settings for the application
+"""
+import os
+
+class Config:
+    """Application configuration"""
+    
+    # Flask settings
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
+    UPLOAD_FOLDER = 'static/uploads'
+    RESULT_FOLDER = 'static/results'
+    MODEL_FOLDER = 'models'
+    DATA_FOLDER = 'data'
+    
+    # Dataset settings
+    VOC_CLASSES = [
+        'background', 'aeroplane', 'bicycle', 'bird', 'boat',
+        'bottle', 'bus', 'car', 'cat', 'chair', 'cow', 'diningtable',
+        'dog', 'horse', 'motorbike', 'person', 'pottedplant',
+        'sheep', 'sofa', 'train', 'tvmonitor'
+    ]
+    
+    # Model settings
+    IMAGE_SIZE = (256, 256)
+    NUM_CLASSES = 21
+    BATCH_SIZE = 4
+    LEARNING_RATE = 0.001
+    NUM_EPOCHS = 20
+    
+    # Training settings
+    USE_GPU = True
+    SAVE_INTERVAL = 5  # Save model every N epochs
+    
+    # CRF settings
+    USE_CRF = True
+    CRF_ITERATIONS = 5
+    
+    # Paths
+    @classmethod
+    def ensure_directories(cls):
+        """Create necessary directories"""
+        os.makedirs(cls.UPLOAD_FOLDER, exist_ok=True)
+        os.makedirs(cls.RESULT_FOLDER, exist_ok=True)
+        os.makedirs(cls.MODEL_FOLDER, exist_ok=True)
+        os.makedirs(cls.DATA_FOLDER, exist_ok=True)# Web
+Flask==2.3.3
+Flask-CORS==4.0.0
+
+# Deep Learning (CPU only)
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
+
+# Core scientific stack
+numpy==1.24.3
+scikit-learn==1.3.0
+matplotlib==3.7.2
+
+# Image processing
+opencv-python==4.8.0.74
+Pillow==10.0.0
+
+# Utils
+tqdm==4.65.0
+requests==2.31.0
+
+# Dataset / tools
+kaggle==1.5.16
+"""
+Dataset setup and verification
+"""
+import os
+import zipfile
+import subprocess
+import sys
+import shutil
+from pathlib import Path
+import requests
+import tqdm
+
+class DatasetSetup:
+    """Handle dataset downloading and setup"""
+    
+    KAGGLE_URL = "https://www.kaggle.com/datasets/gopalbhattrai/pascal-voc-2012-dataset"
+    DATASET_PATHS = [
+        "data/VOCdevkit/VOC2012",
+        "VOCdevkit/VOC2012",
+        "data/VOC2012",
+        "VOC2012",
+        "data/VOC2012_train_val/VOCdevkit/VOC2012"
+    ]
+    
+    @classmethod
+    def find_dataset(cls):
+        """Find existing dataset"""
+        for path_str in cls.DATASET_PATHS:
+            path = Path(path_str)
+            if path.exists():
+                print(f"✅ Found dataset at: {path.absolute()}")
+                return path
+        return None
+    
+    @classmethod
+    def verify_dataset(cls, dataset_path):
+        """Verify dataset structure"""
+        print(f"\n🔍 Verifying dataset at: {dataset_path}")
+        
+        required = {
+            "JPEGImages": "*.jpg",
+            "SegmentationClass": "*.png",
+            "ImageSets/Segmentation": "*.txt"
+        }
+        
+        all_good = True
+        for dir_name, pattern in required.items():
+            dir_path = dataset_path / dir_name
+            
+            if not dir_path.exists():
+                print(f"❌ Missing directory: {dir_name}")
+                all_good = False
+                continue
+            
+            # Count files
+            try:
+                if pattern == "*.jpg":
+                    files = list(dir_path.glob("*.jpg"))
+                    print(f"   {dir_name}: {len(files):,} images")
+                elif pattern == "*.png":
+                    files = list(dir_path.glob("*.png"))
+                    print(f"   {dir_name}: {len(files):,} masks")
+                elif pattern == "*.txt":
+                    txt_files = list(dir_path.glob("*.txt"))
+                    for txt_file in txt_files:
+                        with open(txt_file, 'r') as f:
+                            lines = len([line for line in f if line.strip()])
+                        print(f"   {txt_file.name}: {lines:,} entries")
+            except Exception as e:
+                print(f"   Error reading {dir_name}: {e}")
+                all_good = False
+        
+        return all_good
+    
+    @classmethod
+    def download_via_kaggle(cls):
+        """Download dataset using Kaggle API"""
+        print("\n📥 Downloading via Kaggle API...")
+        
+        try:
+            # Check if kaggle is installed
+            subprocess.run(["kaggle", "--version"], 
+                         capture_output=True, check=True)
+            
+            # Download dataset
+            print("Downloading (this may take several minutes)...")
+            result = subprocess.run([
+                "kaggle", "datasets", "download",
+                "gopalbhattrai/pascal-voc-2012-dataset"
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                # Unzip
+                zip_path = "pascal-voc-2012-dataset.zip"
+                if os.path.exists(zip_path):
+                    print("📂 Extracting dataset...")
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        total = len(zip_ref.namelist())
+                        for i, file in tqdm.tqdm(enumerate(zip_ref.namelist()), 
+                                               total=total, desc="Extracting"):
+                            zip_ref.extract(file, "data")
+                    
+                    os.remove(zip_path)
+                    print("✅ Download complete!")
+                    return True
+            else:
+                print(f"❌ Kaggle error: {result.stderr}")
+                return False
+                
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("❌ Kaggle CLI not found or not configured")
+            return False
+    
+    @classmethod
+    def manual_download_instructions(cls):
+        """Show manual download instructions"""
+        instructions = f"""
+        📝 MANUAL DOWNLOAD REQUIRED
+        
+        1. Visit: {cls.KAGGLE_URL}
+        2. Click the 'Download' button (requires Kaggle login)
+        3. Save the file as 'pascal-voc-2012-dataset.zip'
+        4. Place it in this directory: {Path.cwd()}
+        5. Run this script again
+        
+        Or extract manually:
+        mkdir -p data
+        unzip pascal-voc-2012-dataset.zip -d data/
+        
+        Expected structure after extraction:
+        {Path.cwd()}/data/VOCdevkit/VOC2012/
+        ├── JPEGImages/
+        ├── SegmentationClass/
+        └── ImageSets/Segmentation/
+        """
+        print(instructions)
+        return False
+    
+    @classmethod
+    def setup(cls):
+        """Main setup function"""
+        print("=" * 60)
+        print("PASCAL VOC 2012 DATASET SETUP")
+        print("=" * 60)
+        
+        # Check if dataset already exists
+        dataset_path = cls.find_dataset()
+        if dataset_path:
+            if cls.verify_dataset(dataset_path):
+                return dataset_path
+            else:
+                print("\n⚠️  Dataset exists but is incomplete")
+        
+        # Try to download
+        print("\n📥 Dataset not found. Downloading...")
+        
+        # Try Kaggle API first
+        if cls.download_via_kaggle():
+            dataset_path = cls.find_dataset()
+            if dataset_path and cls.verify_dataset(dataset_path):
+                return dataset_path
+        
+        # Fall back to manual instructions
+        cls.manual_download_instructions()
+        
+        # Check if user manually downloaded
+        zip_path = Path("pascal-voc-2012-dataset.zip")
+        if zip_path.exists():
+            print("\nFound zip file. Extracting...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall("data")
+            zip_path.unlink()
+            
+            dataset_path = cls.find_dataset()
+            if dataset_path:
+                return dataset_path
+        
+        return None
+    
+    @classmethod
+    def create_test_dataset(cls):
+        """Create a small test dataset for development"""
+        print("\n🛠️  Creating test dataset...")
+        
+        test_dir = Path("data/test_voc")
+        test_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create directories
+        (test_dir / "JPEGImages").mkdir(exist_ok=True)
+        (test_dir / "SegmentationClass").mkdir(exist_ok=True)
+        (test_dir / "ImageSets" / "Segmentation").mkdir(parents=True, exist_ok=True)
+        
+        # Create 10 test images
+        import numpy as np
+        from PIL import Image
+        
+        for i in range(10):
+            # Create random image
+            img_array = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+            img = Image.fromarray(img_array)
+            img.save(test_dir / "JPEGImages" / f"test_{i:06d}.jpg")
+            
+            # Create random mask (4 classes)
+            mask_array = np.random.randint(0, 4, (256, 256), dtype=np.uint8) * 50
+            mask = Image.fromarray(mask_array, mode='L')
+            mask.save(test_dir / "SegmentationClass" / f"test_{i:06d}.png")
+        
+        # Create splits
+        with open(test_dir / "ImageSets" / "Segmentation" / "train.txt", "w") as f:
+            f.write("\n".join([f"test_{i:06d}" for i in range(7)]))
+        
+        with open(test_dir / "ImageSets" / "Segmentation" / "val.txt", "w") as f:
+            f.write("\n".join([f"test_{i:06d}" for i in range(7, 10)]))
+        
+        print(f"✅ Created test dataset at: {test_dir}")
+        return test_dir
+
+if __name__ == "__main__":
+    dataset_path = DatasetSetup.setup()
+    
+    if dataset_path:
+        print(f"\n🎉 Dataset ready at: {dataset_path.absolute()}")
+        print("\nYou can now run:")
+        print("python app.py")
+    else:
+        print("\n⚠️  Using test dataset for development")
+        test_path = DatasetSetup.create_test_dataset()
+        print(f"Test dataset at: {test_path}")
+        print("\nRun with test data:")
+        print("python app.py")"""
+Model training script
+"""
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import transforms
+import numpy as np
+import json
+import time
+from datetime import datetime
+from tqdm import tqdm
+from pathlib import Path
+
+from config import Config
+from utils import PascalVOCDataset, SimpleSegmentationModel, SegmentationMetrics
+
+class SegmentationTrainer:
+    """Trainer for semantic segmentation model"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = self._get_device()
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.criterion = None
+        self.metrics = None
+        
+        # Training state
+        self.current_epoch = 0
+        self.best_iou = 0.0
+        self.train_losses = []
+        self.val_losses = []
+        self.train_metrics = []
+        self.val_metrics = []
+        
+        # Create directories
+        Config.ensure_directories()
+        
+        # Setup paths
+        self.checkpoint_dir = Path("checkpoints")
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        
+        self.log_dir = Path("logs")
+        self.log_dir.mkdir(exist_ok=True)
+    
+    def _get_device(self):
+        """Get available device"""
+        if self.config.USE_GPU and torch.cuda.is_available():
+            device = torch.device("cuda")
+            print(f"🚀 Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            device = torch.device("cpu")
+            print("💻 Using CPU")
+        return device
+    
+    def setup_model(self):
+        """Initialize model, optimizer, and loss function"""
+        # Model
+        self.model = SimpleSegmentationModel(
+            num_classes=self.config.NUM_CLASSES
+        ).to(self.device)
+        
+        # Loss function (CrossEntropy + Dice Loss)
+        self.criterion = self._create_criterion()
+        
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.LEARNING_RATE,
+            weight_decay=1e-4
+        )
+        
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=5,
+            verbose=True
+        )
+        
+        # Metrics
+        self.metrics = SegmentationMetrics(self.config.NUM_CLASSES)
+        
+        print(f"✅ Model initialized with {self.count_parameters():,} parameters")
+    
+    def _create_criterion(self):
+        """Create loss function"""
+        class_weight = None
+        
+        # Optional: Add class weights for imbalanced datasets
+        if hasattr(self.config, 'CLASS_WEIGHTS'):
+            class_weight = torch.tensor(
+                self.config.CLASS_WEIGHTS, device=self.device
+            )
+        
+        # CrossEntropy Loss
+        ce_loss = nn.CrossEntropyLoss(
+            weight=class_weight,
+            ignore_index=255  # Ignore void class if present
+        )
+        
+        return ce_loss
+    
+    def count_parameters(self):
+        """Count trainable parameters"""
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+    
+    def load_datasets(self, dataset_path: str):
+        """Load training and validation datasets"""
+        print(f"📂 Loading datasets from: {dataset_path}")
+        
+        # Dataset transformations
+        train_transform = transforms.Compose([
+            # Add data augmentation for training
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.1),
+            transforms.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.1
+            )
+        ])
+        
+        # Training dataset
+        train_dataset = PascalVOCDataset(
+            image_dir=os.path.join(dataset_path, "JPEGImages"),
+            mask_dir=os.path.join(dataset_path, "SegmentationClass"),
+            split="train",
+            image_size=self.config.IMAGE_SIZE
+        )
+        
+        # Validation dataset
+        val_dataset = PascalVOCDataset(
+            image_dir=os.path.join(dataset_path, "JPEGImages"),
+            mask_dir=os.path.join(dataset_path, "SegmentationClass"),
+            split="val",
+            image_size=self.config.IMAGE_SIZE
+        )
+        
+        # Data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        print(f"📊 Training: {len(train_dataset)} images")
+        print(f"📊 Validation: {len(val_dataset)} images")
+        
+        return train_loader, val_loader
+    
+    def train_epoch(self, train_loader, epoch: int):
+        """Train for one epoch"""
+        self.model.train()
+        epoch_loss = 0.0
+        self.metrics.reset()
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.NUM_EPOCHS}")
+        
+        for batch_idx, (images, masks, _) in enumerate(progress_bar):
+            # Move to device
+            images = images.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True)
+            
+            # Forward pass
+            outputs = self.model(images)
+            loss = self.criterion(outputs, masks)
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update metrics
+            epoch_loss += loss.item()
+            
+            # Calculate predictions
+            with torch.no_grad():
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                masks_np = masks.cpu().numpy()
+                self.metrics.update(preds, masks_np)
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
+            })
+        
+        # Calculate epoch metrics
+        avg_loss = epoch_loss / len(train_loader)
+        epoch_metrics = self.metrics.get_scores()
+        
+        return avg_loss, epoch_metrics
+    
+    def validate(self, val_loader):
+        """Validate the model"""
+        self.model.eval()
+        epoch_loss = 0.0
+        self.metrics.reset()
+        
+        with torch.no_grad():
+            for images, masks, _ in tqdm(val_loader, desc="Validation"):
+                # Move to device
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+                
+                # Forward pass
+                outputs = self.model(images)
+                loss = self.criterion(outputs, masks)
+                
+                # Update metrics
+                epoch_loss += loss.item()
+                
+                # Calculate predictions
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                masks_np = masks.cpu().numpy()
+                self.metrics.update(preds, masks_np)
+        
+        # Calculate metrics
+        avg_loss = epoch_loss / len(val_loader)
+        val_metrics = self.metrics.get_scores()
+        
+        return avg_loss, val_metrics
+    
+    def save_checkpoint(self, epoch: int, is_best: bool = False):
+        """Save model checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_iou': self.best_iou,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'train_metrics': self.train_metrics,
+            'val_metrics': self.val_metrics,
+            'config': self.config.__dict__
+        }
+        
+        # Regular checkpoint
+        checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Best model
+        if is_best:
+            best_path = self.checkpoint_dir / "best_model.pth"
+            torch.save(checkpoint, best_path)
+            print(f"🏆 Saved best model (IoU: {self.best_iou:.4f})")
+        
+        # Latest model
+        latest_path = Path(self.config.MODEL_FOLDER) / "latest_model.pth"
+        torch.save(self.model.state_dict(), latest_path)
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint"""
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ Checkpoint not found: {checkpoint_path}")
+            return False
+        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        self.current_epoch = checkpoint['epoch']
+        self.best_iou = checkpoint['best_iou']
+        self.train_losses = checkpoint['train_losses']
+        self.val_losses = checkpoint['val_losses']
+        self.train_metrics = checkpoint['train_metrics']
+        self.val_metrics = checkpoint['val_metrics']
+        
+        print(f"✅ Loaded checkpoint from epoch {self.current_epoch}")
+        print(f"   Best IoU: {self.best_iou:.4f}")
+        
+        return True
+    
+    def train(self, dataset_path: str, epochs: int = None):
+        """Main training loop"""
+        # Setup
+        self.setup_model()
+        
+        # Load datasets
+        train_loader, val_loader = self.load_datasets(dataset_path)
+        
+        # Use provided epochs or config epochs
+        if epochs is None:
+            epochs = self.config.NUM_EPOCHS
+        
+        print(f"🚀 Starting training for {epochs} epochs")
+        print(f"📈 Target metrics will be saved to: {self.log_dir}")
+        
+        # Training loop
+        for epoch in range(self.current_epoch, epochs):
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"{'='*60}")
+            
+            # Train
+            start_time = time.time()
+            train_loss, train_metrics = self.train_epoch(train_loader, epoch)
+            train_time = time.time() - start_time
+            
+            # Validate
+            start_time = time.time()
+            val_loss, val_metrics = self.validate(val_loader)
+            val_time = time.time() - start_time
+            
+            # Update learning rate
+            self.scheduler.step(val_metrics["mean_iou"])
+            
+            # Store metrics
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.train_metrics.append(train_metrics)
+            self.val_metrics.append(val_metrics)
+            
+            # Print epoch summary
+            print(f"\n📊 Epoch {epoch+1} Summary:")
+            print(f"   Time: Train={train_time:.1f}s, Val={val_time:.1f}s")
+            print(f"   Loss: Train={train_loss:.4f}, Val={val_loss:.4f}")
+            print(f"   Train Pixel Acc: {train_metrics['pixel_accuracy']:.4f}")
+            print(f"   Val Pixel Acc: {val_metrics['pixel_accuracy']:.4f}")
+            print(f"   Val mIoU: {val_metrics['mean_iou']:.4f}")
+            
+            # Save checkpoint
+            is_best = val_metrics["mean_iou"] > self.best_iou
+            if is_best:
+                self.best_iou = val_metrics["mean_iou"]
+            
+            if (epoch + 1) % self.config.SAVE_INTERVAL == 0 or is_best:
+                self.save_checkpoint(epoch + 1, is_best)
+            
+            # Save training log
+            self.save_training_log(epoch + 1)
+        
+        print(f"\n🎉 Training completed!")
+        print(f"🏆 Best validation IoU: {self.best_iou:.4f}")
+        
+        # Save final model
+        final_path = Path(self.config.MODEL_FOLDER) / "final_model.pth"
+        torch.save(self.model.state_dict(), final_path)
+        print(f"💾 Final model saved to: {final_path}")
+        
+        return self.model
+    
+    def save_training_log(self, epoch: int):
+        """Save training log to JSON"""
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "epoch": epoch,
+            "train_loss": self.train_losses[-1] if self.train_losses else None,
+            "val_loss": self.val_losses[-1] if self.val_losses else None,
+            "train_metrics": self.train_metrics[-1] if self.train_metrics else None,
+            "val_metrics": self.val_metrics[-1] if self.val_metrics else None,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "best_iou": self.best_iou
+        }
+        
+        log_file = self.log_dir / f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        with open(log_file, 'w') as f:
+            json.dump(log_data, f, indent=2)
+    
+    def get_training_status(self):
+        """Get current training status for web interface"""
+        if not self.train_losses:
+            return {
+                "status": "not_started",
+                "epoch": 0,
+                "total_epochs": self.config.NUM_EPOCHS,
+                "progress": 0,
+                "current_loss": 0,
+                "current_iou": 0
+            }
+        
+        progress = (len(self.train_losses) / self.config.NUM_EPOCHS) * 100
+        
+        return {
+            "status": "training",
+            "epoch": len(self.train_losses),
+            "total_epochs": self.config.NUM_EPOCHS,
+            "progress": progress,
+            "current_loss": self.train_losses[-1] if self.train_losses else 0,
+            "current_iou": self.val_metrics[-1]["mean_iou"] if self.val_metrics else 0,
+            "best_iou": self.best_iou
+        }
+
+def train_model_background(config_params: dict, callback=None):
+    """Background training function for web interface"""
+    try:
+        # Update config with provided parameters
+        for key, value in config_params.items():
+            if hasattr(Config, key):
+                setattr(Config, key, value)
+        
+        # Initialize trainer
+        trainer = SegmentationTrainer(Config)
+        
+        # Find dataset
+        from setup_data import DatasetSetup
+        dataset_path = DatasetSetup.find_dataset()
+        
+        if not dataset_path:
+            dataset_path = DatasetSetup.setup()
+        
+        if not dataset_path:
+            if callback:
+                callback("error", "Dataset not found. Please download it first.")
+            return None
+        
+        # Train
+        model = trainer.train(str(dataset_path), config_params.get('epochs', Config.NUM_EPOCHS))
+        
+        if callback:
+            callback("complete", {
+                "message": "Training completed successfully!",
+                "best_iou": trainer.best_iou,
+                "final_loss": trainer.val_losses[-1] if trainer.val_losses else 0
+            })
+        
+        return model
+        
+    except Exception as e:
+        if callback:
+            callback("error", str(e))
+        raise"""
+Utility functions for data handling and model operations
+"""
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import json
+from pathlib import Path
+from typing import Tuple, List, Dict, Any
+import matplotlib.pyplot as plt
+from config import Config
+
+class PascalVOCDataset(Dataset):
+    """Dataset class for Pascal VOC 2012"""
+    
+    def __init__(self, image_dir: str, mask_dir: str, split: str = "train",
+                 transform=None, image_size: Tuple[int, int] = (256, 256)):
+        """
+        Args:
+            image_dir: Directory with images
+            mask_dir: Directory with segmentation masks
+            split: 'train', 'val', or 'test'
+            transform: Optional transforms
+            image_size: Target image size (H, W)
+        """
+        self.image_dir = Path(image_dir)
+        self.mask_dir = Path(mask_dir)
+        self.split = split
+        self.transform = transform
+        self.image_size = image_size
+        
+        # Get split file
+        split_file = self.image_dir.parent / "ImageSets" / "Segmentation" / f"{split}.txt"
+        
+        if split_file.exists():
+            with open(split_file, 'r') as f:
+                self.image_names = [line.strip() for line in f if line.strip()]
+        else:
+            # If no split file, use all images
+            self.image_names = sorted([
+                f.stem for f in self.image_dir.glob("*.jpg")
+                if (self.mask_dir / f"{f.stem}.png").exists()
+            ])
+        
+        print(f"📊 {split} dataset: {len(self.image_names)} images")
+    
+    def __len__(self):
+        return len(self.image_names)
+    
+    def __getitem__(self, idx):
+        # Get image name
+        img_name = self.image_names[idx]
+        
+        # Load image
+        img_path = self.image_dir / f"{img_name}.jpg"
+        if not img_path.exists():
+            img_path = self.image_dir / f"{img_name}.png"
+        
+        image = Image.open(img_path).convert('RGB')
+        
+        # Load mask
+        mask_path = self.mask_dir / f"{img_name}.png"
+        if mask_path.exists():
+            mask = Image.open(mask_path)
+        else:
+            # Create empty mask if not found
+            mask = Image.new('L', image.size)
+        
+        # Resize
+        image = image.resize(self.image_size, Image.BILINEAR)
+        mask = mask.resize(self.image_size, Image.NEAREST)
+        
+        # Convert to tensors
+        image_tensor = transforms.ToTensor()(image)
+        mask_tensor = torch.from_numpy(np.array(mask)).long()
+        
+        # Normalize image
+        image_tensor = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )(image_tensor)
+        
+        return image_tensor, mask_tensor, img_name
+
+class SimpleSegmentationModel(nn.Module):
+    """Simple CNN for semantic segmentation"""
+    
+    def __init__(self, num_classes: int = 21):
+        super().__init__()
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 128x128
+            
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 64x64
+            
+            # Block 3
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 32x32
+        )
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            # Block 4
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            # Block 5
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            # Block 6
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            # Final layer
+            nn.Conv2d(64, num_classes, kernel_size=1)
+        )
+    
+    def forward(self, x):
+        features = self.encoder(x)
+        output = self.decoder(features)
+        return output
+
+class SegmentationMetrics:
+    """Calculate segmentation metrics"""
+    
+    def __init__(self, num_classes: int):
+        self.num_classes = num_classes
+        self.confusion_matrix = np.zeros((num_classes, num_classes))
+    
+    def update(self, pred: np.ndarray, target: np.ndarray):
+        """Update confusion matrix"""
+        mask = (target >= 0) & (target < self.num_classes)
+        hist = np.bincount(
+            self.num_classes * target[mask].astype(int) + pred[mask],
+            minlength=self.num_classes ** 2
+        ).reshape(self.num_classes, self.num_classes)
+        self.confusion_matrix += hist
+    
+    def get_scores(self):
+        """Calculate metrics"""
+        hist = self.confusion_matrix
+        
+        # Pixel accuracy
+        pixel_acc = np.diag(hist).sum() / hist.sum()
+        
+        # Class accuracy
+        class_acc = np.diag(hist) / hist.sum(axis=1)
+        mean_class_acc = np.nanmean(class_acc)
+        
+        # IoU
+        iou = np.diag(hist) / (hist.sum(axis=1) + hist.sum(axis=0) - np.diag(hist))
+        mean_iou = np.nanmean(iou)
+        
+        # Frequency weighted IoU
+        freq = hist.sum(axis=1) / hist.sum()
+        fw_iou = (freq[freq > 0] * iou[freq > 0]).sum()
+        
+        return {
+            "pixel_accuracy": float(pixel_acc),
+            "mean_class_accuracy": float(mean_class_acc),
+            "mean_iou": float(mean_iou),
+            "frequency_weighted_iou": float(fw_iou),
+            "class_iou": iou.tolist()
+        }
+    
+    def reset(self):
+        """Reset metrics"""
+        self.confusion_matrix = np.zeros((self.num_classes, self.num_classes))
+
+def prepare_dataset_info():
+    """Get information about the dataset"""
+    from setup_data import DatasetSetup
+    
+    # Try to find dataset
+    dataset_path = DatasetSetup.find_dataset()
+    
+    if not dataset_path:
+        # Try to setup
+        dataset_path = DatasetSetup.setup()
+    
+    if not dataset_path:
+        # Create test dataset
+        dataset_path = DatasetSetup.create_test_dataset()
+        dataset_status = "test"
+    else:
+        dataset_status = "real"
+    
+    # Get statistics
+    image_dir = dataset_path / "JPEGImages"
+    mask_dir = dataset_path / "SegmentationClass"
+    
+    if not image_dir.exists():
+        return {
+            "status": "error",
+            "message": "Dataset not properly initialized"
+        }
+    
+    # Count images
+    image_files = list(image_dir.glob("*.jpg"))
+    if not image_files:
+        image_files = list(image_dir.glob("*.png"))
+    
+    image_count = len(image_files)
+    
+    # Get splits
+    splits = {}
+    split_dir = dataset_path / "ImageSets" / "Segmentation"
+    
+    if split_dir.exists():
+        for split_file in ["train.txt", "val.txt", "trainval.txt"]:
+            file_path = split_dir / split_file
+            if file_path.exists():
+                with open(file_path, 'r') as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                    splits[split_file.replace('.txt', '')] = len(lines)
+    
+    return {
+        "status": "ready",
+        "dataset_status": dataset_status,
+        "path": str(dataset_path.absolute()),
+        "total_images": image_count,
+        "splits": splits,
+        "classes": Config.VOC_CLASSES,
+        "class_count": Config.NUM_CLASSES
+    }
+
+def predict_single_image(model, image_path, device="cpu"):
+    """Make prediction on a single image"""
+    # Load and preprocess image
+    image = Image.open(image_path).convert('RGB')
+    original_size = image.size
+    
+    # Resize
+    image_resized = image.resize(Config.IMAGE_SIZE, Image.BILINEAR)
+    
+    # Convert to tensor
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    image_tensor = transform(image_resized).unsqueeze(0).to(device)
+    
+    # Predict
+    model.eval()
+    with torch.no_grad():
+        output = model(image_tensor)
+        pred = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+    
+    # Resize prediction to original size
+    pred_resized = np.array(Image.fromarray(pred.astype(np.uint8)).resize(
+        original_size, Image.NEAREST))
+    
+    # Create colored segmentation
+    color_map = create_color_map()
+    colored_seg = np.zeros((*pred_resized.shape, 3), dtype=np.uint8)
+    
+    for class_id, color in enumerate(color_map):
+        mask = pred_resized == class_id
+        colored_seg[mask] = color
+    
+    # Blend with original image
+    original_np = np.array(image)
+    alpha = 0.5
+    blended = (alpha * colored_seg + (1 - alpha) * original_np).astype(np.uint8)
+    
+    # Count classes
+    unique_classes = np.unique(pred_resized)
+    detected_classes = [
+        Config.VOC_CLASSES[cls_id] for cls_id in unique_classes
+        if cls_id < len(Config.VOC_CLASSES)
+    ]
+    
+    return {
+        "original": original_np,
+        "segmentation": pred_resized,
+        "colored_segmentation": colored_seg,
+        "blended": blended,
+        "detected_classes": detected_classes,
+        "class_ids": unique_classes.tolist()
+    }
+
+def create_color_map():
+    """Create color map for visualization"""
+    color_map = []
+    
+    for i in range(Config.NUM_CLASSES):
+        # Generate distinct colors
+        if i == 0:  # Background
+            color_map.append((0, 0, 0))
+        else:
+            # Generate colors using golden ratio
+            golden_ratio_conjugate = 0.618033988749895
+            h = (i * golden_ratio_conjugate) % 1.0
+            
+            # Convert HSV to RGB
+            h_i = int(h * 6)
+            f = h * 6 - h_i
+            p = 0
+            q = int(255 * (1 - f))
+            t = int(255 * f)
+            
+            if h_i == 0:
+                color = (255, t, p)
+            elif h_i == 1:
+                color = (q, 255, p)
+            elif h_i == 2:
+                color = (p, 255, t)
+            elif h_i == 3:
+                color = (p, q, 255)
+            elif h_i == 4:
+                color = (t, p, 255)
+            else:
+                color = (255, p, q)
+            
+            color_map.append(color)
+    
+    return color_map
+
+def save_prediction_results(results: Dict, base_name: str):
+    """Save prediction results to files"""
+    import uuid
+    
+    # Generate unique ID
+    unique_id = str(uuid.uuid4())[:8]
+    
+    # Save files
+    result_files = {}
+    
+    # Original image (resized for display)
+    orig_path = Config.UPLOAD_FOLDER / f"{base_name}_{unique_id}_orig.jpg"
+    Image.fromarray(results["original"]).save(orig_path)
+    result_files["original"] = f"/static/uploads/{orig_path.name}"
+    
+    # Colored segmentation
+    seg_path = Config.RESULT_FOLDER / f"{base_name}_{unique_id}_seg.jpg"
+    Image.fromarray(results["colored_segmentation"]).save(seg_path)
+    result_files["segmentation"] = f"/static/results/{seg_path.name}"
+    
+    # Blended image
+    blend_path = Config.RESULT_FOLDER / f"{base_name}_{unique_id}_blend.jpg"
+    Image.fromarray(results["blended"]).save(blend_path)
+    result_files["blended"] = f"/static/results/{blend_path.name}"
+    
+    # Save mask as PNG
+    mask_path = Config.RESULT_FOLDER / f"{base_name}_{unique_id}_mask.png"
+    Image.fromarray(results["segmentation"].astype(np.uint8)).save(mask_path)
+    result_files["mask"] = f"/static/results/{mask_path.name}"
+    
+    return result_files/* Main styles for the application */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --primary-color: #4361ee;
+    --secondary-color: #3a0ca3;
+    --success-color: #4cc9f0;
+    --danger-color: #f72585;
+    --warning-color: #f8961e;
+    --dark-color: #212529;
+    --light-color: #f8f9fa;
+    --gray-color: #6c757d;
+    --border-radius: 12px;
+    --box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+    --transition: all 0.3s ease;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: var(--dark-color);
+    min-height: 100vh;
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* Header */
+.header {
+    text-align: center;
+    margin-bottom: 40px;
+    padding: 40px 20px;
+    background: white;
+    border-radius: var(--border-radius);
+    box-shadow: var(--box-shadow);
+}
+
+.header h1 {
+    color: var(--primary-color);
+    font-size: 2.8rem;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 15px;
+}
+
+.header p {
+    color: var(--gray-color);
+    font-size: 1.2rem;
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+/* Dashboard */
+.dashboard {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 25px;
+    margin-bottom: 25px;
+}
+
+/* Cards */
+.card {
+    background: white;
+    border-radius: var(--border-radius);
+    padding: 30px;
+    box-shadow: var(--box-shadow);
+    transition: var(--transition);
+    border: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.15);
+}
+
+.card h2 {
+    color: var(--dark-color);
+    font-size: 1.5rem;
+    margin-bottom: 25px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 15px;
+    border-bottom: 2px solid var(--light-color);
+}
+
+/* Dataset Info */
+.dataset-info {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 15px;
+    margin-bottom: 20px;
+}
+
+.info-item {
+    background: var(--light-color);
+    padding: 15px;
+    border-radius: 8px;
+    text-align: center;
+}
+
+.info-item i {
+    font-size: 1.5rem;
+    color: var(--primary-color);
+    margin-bottom: 8px;
+}
+
+.info-item .label {
+    font-size: 0.9rem;
+    color: var(--gray-color);
+    margin-bottom: 5px;
+}
+
+.info-item .value {
+    font-size: 1.3rem;
+    font-weight: 600;
+    color: var(--dark-color);
+}
+
+.classes-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 15px;
+}
+
+.class-tag {
+    background: var(--primary-color);
+    color: white;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    transition: var(--transition);
+}
+
+.class-tag:hover {
+    background: var(--secondary-color);
+    transform: translateY(-2px);
+}
+
+/* Forms */
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 500;
+    color: var(--dark-color);
+}
+
+.form-group input,
+.form-group select {
+    width: 100%;
+    padding: 12px 16px;
+    border: 2px solid #e9ecef;
+    border-radius: 8px;
+    font-size: 1rem;
+    transition: var(--transition);
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.2);
+}
+
+/* Buttons */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 14px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition);
+    text-decoration: none;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+    color: white;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 25px rgba(67, 97, 238, 0.3);
+}
+
+.btn-secondary {
+    background: var(--gray-color);
+    color: white;
+}
+
+.btn-secondary:hover {
+    background: #5a6268;
+    transform: translateY(-2px);
+}
+
+.btn-success {
+    background: var(--success-color);
+    color: white;
+}
+
+.btn-danger {
+    background: var(--danger-color);
+    color: white;
+}
+
+.btn-block {
+    width: 100%;
+}
+
+.btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none !important;
+}
+
+/* Training Progress */
+.progress-container {
+    margin: 25px 0;
+}
+
+.progress-bar {
+    height: 12px;
+    background: #e9ecef;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 10px;
+}
+
+.progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary-color), var(--success-color));
+    border-radius: 6px;
+    transition: width 0.5s ease;
+}
+
+.progress-text {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.9rem;
+    color: var(--gray-color);
+}
+
+.metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 15px;
+    margin-top: 20px;
+}
+
+.metric-item {
+    text-align: center;
+    padding: 15px;
+    background: var(--light-color);
+    border-radius: 8px;
+}
+
+.metric-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: var(--primary-color);
+    margin-bottom: 5px;
+}
+
+.metric-label {
+    font-size: 0.9rem;
+    color: var(--gray-color);
+}
+
+/* Prediction Results */
+.image-upload {
+    border: 2px dashed #dee2e6;
+    border-radius: 8px;
+    padding: 40px 20px;
+    text-align: center;
+    margin-bottom: 20px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.image-upload:hover {
+    border-color: var(--primary-color);
+    background: rgba(67, 97, 238, 0.05);
+}
+
+.image-upload i {
+    font-size: 3rem;
+    color: var(--primary-color);
+    margin-bottom: 15px;
+}
+
+.image-upload p {
+    color: var(--gray-color);
+    margin-bottom: 10px;
+}
+
+.image-comparison {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 20px;
+    margin: 25px 0;
+}
+
+.image-container {
+    background: var(--light-color);
+    padding: 15px;
+    border-radius: 8px;
+    text-align: center;
+}
+
+.image-container h4 {
+    margin-bottom: 15px;
+    color: var(--dark-color);
+}
+
+.result-image {
+    width: 100%;
+    max-width: 400px;
+    height: auto;
+    border-radius: 8px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+}
+
+/* Logs */
+.logs-container {
+    margin-top: 30px;
+}
+
+.logs-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+
+.logs {
+    background: #1a1a1a;
+    color: #f0f0f0;
+    padding: 20px;
+    border-radius: 8px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.9rem;
+}
+
+.log-entry {
+    padding: 8px 0;
+    border-bottom: 1px solid #333;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-entry.info {
+    color: #4cc9f0;
+}
+
+.log-entry.success {
+    color: #4ade80;
+}
+
+.log-entry.warning {
+    color: #fbbf24;
+}
+
+.log-entry.error {
+    color: #f87171;
+}
+
+/* Status indicators */
+.status-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+
+.status-idle {
+    background: rgba(108, 117, 125, 0.1);
+    color: var(--gray-color);
+}
+
+.status-training {
+    background: rgba(76, 201, 240, 0.1);
+    color: var(--success-color);
+}
+
+.status-completed {
+    background: rgba(76, 222, 128, 0.1);
+    color: #4ade80;
+}
+
+.status-error {
+    background: rgba(248, 113, 113, 0.1);
+    color: var(--danger-color);
+}
+
+/* Footer */
+.footer {
+    text-align: center;
+    margin-top: 40px;
+    padding: 20px;
+    color: white;
+    font-size: 0.9rem;
+}
+
+.footer a {
+    color: white;
+    text-decoration: none;
+}
+
+.footer a:hover {
+    text-decoration: underline;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .dashboard {
+        grid-template-columns: 1fr;
+    }
+    
+    .header h1 {
+        font-size: 2rem;
+    }
+    
+    .card {
+        padding: 20px;
+    }
+    
+    .image-comparison {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Animations */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.fade-in {
+    animation: fadeIn 0.5s ease forwards;
+}
+
+.pulse {
+    animation: pulse 2s infinite;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--primary-color);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--secondary-color);
+}/**
+ * Main JavaScript for Semantic Segmentation Web Application
+ */
+
+// Application state
+const AppState = {
+    training: {
+        isTraining: false,
+        progress: 0,
+        currentEpoch: 0,
+        totalEpochs: 0,
+        currentLoss: 0,
+        currentIoU: 0,
+        bestIoU: 0,
+        logs: []
+    },
+    dataset: {
+        loaded: false,
+        info: null
+    },
+    model: {
+        loaded: false,
+        name: null
+    }
+};
+
+// DOM Elements
+const DOM = {
+    // Dataset elements
+    datasetInfo: document.getElementById('dataset-info'),
+    datasetStatus: document.getElementById('dataset-status'),
+    
+    // Training elements
+    trainingForm: document.getElementById('training-form'),
+    startTrainingBtn: document.getElementById('start-training-btn'),
+    stopTrainingBtn: document.getElementById('stop-training-btn'),
+    trainingProgress: document.getElementById('training-progress'),
+    progressFill: document.getElementById('progress-fill'),
+    progressText: document.getElementById('progress-text'),
+    currentEpoch: document.getElementById('current-epoch'),
+    currentLoss: document.getElementById('current-loss'),
+    currentIoU: document.getElementById('current-iou'),
+    bestIoU: document.getElementById('best-iou'),
+    trainingLogs: document.getElementById('training-logs'),
+    
+    // Prediction elements
+    imageUpload: document.getElementById('image-upload'),
+    predictBtn: document.getElementById('predict-btn'),
+    originalImage: document.getElementById('original-image'),
+    segmentedImage: document.getElementById('segmented-image'),
+    blendedImage: document.getElementById('blended-image'),
+    detectedClasses: document.getElementById('detected-classes'),
+    predictionResults: document.getElementById('prediction-results'),
+    
+    // System logs
+    systemLogs: document.getElementById('system-logs'),
+    
+    // Status indicators
+    trainingStatus: document.getElementById('training-status'),
+    modelStatus: document.getElementById('model-status')
+};
+
+// API Endpoints
+const API = {
+    DATASET_INFO: '/api/dataset/info',
+    DATASET_SETUP: '/api/dataset/setup',
+    TRAINING_STATUS: '/api/training/status',
+    TRAINING_START: '/api/training/start',
+    TRAINING_STOP: '/api/training/stop',
+    MODEL_PREDICT: '/api/model/predict',
+    MODEL_LIST: '/api/model/list',
+    MODEL_LOAD: '/api/model/load',
+    SYSTEM_HEALTH: '/api/system/health'
+};
+
+// Utility functions
+const Utils = {
+    // Format bytes to human readable format
+    formatBytes(bytes, decimals = 2) {
+        if (bytes === 0) return '0 Bytes';
+        
+        const k = 1024;
+        const dm = decimals < 0 ? 0 : decimals;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    },
+    
+    // Format time
+    formatTime(seconds) {
+        if (!seconds) return '00:00:00';
+        
+        const hrs = Math.floor(seconds / 3600);
+        const mins = Math.floor((seconds % 3600) / 60);
+        const secs = Math.floor(seconds % 60);
+        
+        return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    },
+    
+    // Add log entry
+    addLog(message, type = 'info', element = DOM.systemLogs) {
+        const timestamp = new Date().toLocaleTimeString();
+        const logEntry = document.createElement('div');
+        logEntry.className = `log-entry ${type}`;
+        logEntry.innerHTML = `
+            <span class="log-time">[${timestamp}]</span>
+            <span class="log-message">${message}</span>
+        `;
+        
+        element.prepend(logEntry);
+        
+        // Keep only last 20 logs
+        const logs = element.querySelectorAll('.log-entry');
+        if (logs.length > 20) {
+            logs[logs.length - 1].remove();
+        }
+    },
+    
+    // Update status indicator
+    updateStatusIndicator(element, status, text) {
+        element.className = `status-indicator status-${status}`;
+        element.innerHTML = `
+            <i class="fas fa-circle"></i>
+            <span>${text}</span>
+        `;
+    },
+    
+    // Show notification
+    showNotification(message, type = 'info') {
+        // Create notification element
+        const notification = document.createElement('div');
+        notification.className = `notification notification-${type} fade-in`;
+        notification.innerHTML = `
+            <i class="fas fa-${type === 'success' ? 'check-circle' : type === 'error' ? 'exclamation-circle' : 'info-circle'}"></i>
+            <span>${message}</span>
+            <button class="notification-close" onclick="this.parentElement.remove()">
+                <i class="fas fa-times"></i>
+            </button>
+        `;
+        
+        // Add to notification container
+        const container = document.getElementById('notifications') || (() => {
+            const div = document.createElement('div');
+            div.id = 'notifications';
+            div.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                z-index: 1000;
+                max-width: 400px;
+            `;
+            document.body.appendChild(div);
+            return div;
+        })();
+        
+        container.prepend(notification);
+        
+        // Auto-remove after 5 seconds
+        setTimeout(() => {
+            if (notification.parentElement) {
+                notification.remove();
+            }
+        }, 5000);
+    },
+    
+    // Format number with precision
+    formatNumber(num, precision = 4) {
+        if (num === null || num === undefined) return 'N/A';
+        return Number(num).toFixed(precision);
+    }
+};
+
+// API Service
+const ApiService = {
+    // Generic fetch wrapper
+    async fetch(endpoint, options = {}) {
+        const defaultOptions = {
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
+        };
+        
+        const mergedOptions = { ...defaultOptions, ...options };
+        
+        try {
+            const response = await fetch(endpoint, mergedOptions);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            return await response.json();
+        } catch (error) {
+            Utils.addLog(`API Error: ${error.message}`, 'error');
+            throw error;
+        }
+    },
+    
+    // Get dataset information
+    async getDatasetInfo() {
+        return this.fetch(API.DATASET_INFO);
+    },
+    
+    // Setup dataset
+    async setupDataset() {
+        return this.fetch(API.DATASET_SETUP, {
+            method: 'POST'
+        });
+    },
+    
+    // Get training status
+    async getTrainingStatus() {
+        return this.fetch(API.TRAINING_STATUS);
+    },
+    
+    // Start training
+    async startTraining(params) {
+        return this.fetch(API.TRAINING_START, {
+            method: 'POST',
+            body: JSON.stringify(params)
+        });
+    },
+    
+    // Stop training
+    async stopTraining() {
+        return this.fetch(API.TRAINING_STOP, {
+            method: 'POST'
+        });
+    },
+    
+    // Make prediction
+    async predict(imageFile) {
+        const formData = new FormData();
+        formData.append('image', imageFile);
+        
+        const response = await fetch(API.MODEL_PREDICT, {
+            method: 'POST',
+            body: formData
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        return await response.json();
+    },
+    
+    // List available models
+    async listModels() {
+        return this.fetch(API.MODEL_LIST);
+    },
+    
+    // Load model
+    async loadModel(modelPath) {
+        return this.fetch(API.MODEL_LOAD, {
+            method: 'POST',
+            body: JSON.stringify({ model_path: modelPath })
+        });
+    },
+    
+    // Health check
+    async healthCheck() {
+        return this.fetch(API.SYSTEM_HEALTH);
+    }
+};
+
+// Dataset Module
+const DatasetModule = {
+    async loadDatasetInfo() {
+        try {
+            Utils.addLog('Loading dataset information...');
+            
+            const data = await ApiService.getDatasetInfo();
+            
+            if (data.status === 'ready') {
+                this.updateDatasetInfo(data);
+                AppState.dataset.loaded = true;
+                AppState.dataset.info = data;
+                
+                Utils.addLog('Dataset loaded successfully', 'success');
+                Utils.updateStatusIndicator(DOM.datasetStatus, 'completed', 'Ready');
+            } else {
+                this.showDatasetSetupInstructions(data);
+                Utils.updateStatusIndicator(DOM.datasetStatus, 'error', 'Not Found');
+            }
+        } catch (error) {
+            Utils.addLog(`Failed to load dataset: ${error.message}`, 'error');
+            Utils.updateStatusIndicator(DOM.datasetStatus, 'error', 'Error');
+        }
+    },
+    
+    updateDatasetInfo(data) {
+        DOM.datasetInfo.innerHTML = `
+            <div class="dataset-info">
+                <div class="info-item">
+                    <i class="fas fa-images"></i>
+                    <div class="label">Total Images</div>
+                    <div class="value">${data.total_images.toLocaleString()}</div>
+                </div>
+                ${data.splits ? Object.entries(data.splits).map(([split, count]) => `
+                    <div class="info-item">
+                        <i class="fas fa-${split === 'train' ? 'train' : split === 'val' ? 'check-circle' : 'database'}"></i>
+                        <div class="label">${split.toUpperCase()}</div>
+                        <div class="value">${count.toLocaleString()}</div>
+                    </div>
+                `).join('') : ''}
+                <div class="info-item">
+                    <i class="fas fa-tags"></i>
+                    <div class="label">Classes</div>
+                    <div class="value">${data.class_count}</div>
+                </div>
+            </div>
+            
+            <div class="classes-section">
+                <h4><i class="fas fa-list"></i> Object Classes</h4>
+                <div class="classes-grid">
+                    ${data.classes.map((cls, idx) => `
+                        <span class="class-tag" title="${cls}">
+                            ${cls}
+                        </span>
+                    `).join('')}
+                </div>
+            </div>
+            
+            ${data.dataset_status === 'test' ? `
+                <div class="alert alert-warning">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    Using test dataset. Download real dataset for better results.
+                </div>
+            ` : ''}
+        `;
+    },
+    
+    showDatasetSetupInstructions(data) {
+        DOM.datasetInfo.innerHTML = `
+            <div class="alert alert-info">
+                <i class="fas fa-info-circle"></i>
+                <h4>Dataset Not Found</h4>
+                <p>${data.message || 'The Pascal VOC 2012 dataset is not available.'}</p>
+                
+                <div class="setup-instructions">
+                    <h5>Setup Instructions:</h5>
+                    <ol>
+                        <li>Click the button below to download automatically</li>
+                        <li>Or download manually from: 
+                            <a href="https://www.kaggle.com/datasets/gopalbhattrai/pascal-voc-2012-dataset" target="_blank">
+                                Kaggle Dataset
+                            </a>
+                        </li>
+                        <li>Extract to: <code>data/VOCdevkit/VOC2012/</code></li>
+                    </ol>
+                </div>
+                
+                <button id="setup-dataset-btn" class="btn btn-primary">
+                    <i class="fas fa-download"></i> Setup Dataset Automatically
+                </button>
+            </div>
+        `;
+        
+        // Add event listener to setup button
+        document.getElementById('setup-dataset-btn')?.addEventListener('click', () => {
+            this.setupDataset();
+        });
+    },
+    
+    async setupDataset() {
+        try {
+            Utils.addLog('Setting up dataset...');
+            
+            const result = await ApiService.setupDataset();
+            
+            if (result.success) {
+                Utils.showNotification('Dataset setup completed successfully!', 'success');
+                Utils.addLog('Dataset setup completed', 'success');
+                
+                // Reload dataset info
+                setTimeout(() => this.loadDatasetInfo(), 2000);
+            } else {
+                Utils.showNotification(`Failed to setup dataset: ${result.message}`, 'error');
+                Utils.addLog(`Dataset setup failed: ${result.message}`, 'error');
+            }
+        } catch (error) {
+            Utils.showNotification(`Error setting up dataset: ${error.message}`, 'error');
+            Utils.addLog(`Dataset setup error: ${error.message}`, 'error');
+        }
+    }
+};
+
+// Training Module
+const TrainingModule = {
+    pollingInterval: null,
+    
+    init() {
+        // Load training status
+        this.loadTrainingStatus();
+        
+        // Start polling for updates
+        this.startPolling();
+        
+        // Setup form submission
+        DOM.trainingForm?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.startTraining();
+        });
+        
+        // Setup stop button
+        DOM.stopTrainingBtn?.addEventListener('click', () => {
+            this.stopTraining();
+        });
+    },
+    
+    async loadTrainingStatus() {
+        try {
+            const data = await ApiService.getTrainingStatus();
+            this.updateTrainingState(data);
+        } catch (error) {
+            Utils.addLog(`Failed to load training status: ${error.message}`, 'error');
+        }
+    },
+    
+    updateTrainingState(data) {
+        AppState.training.isTraining = data.is_training;
+        AppState.training.progress = data.progress;
+        AppState.training.currentEpoch = data.current_epoch;
+        AppState.training.totalEpochs = data.total_epochs;
+        AppState.training.currentLoss = data.current_loss;
+        AppState.training.currentIoU = data.current_iou;
+        AppState.training.bestIoU = data.best_iou;
+        AppState.training.logs = data.logs || [];
+        
+        this.updateUI();
+    },
+    
+    updateUI() {
+        // Update progress bar
+        DOM.progressFill.style.width = `${AppState.training.progress}%`;
+        DOM.progressText.textContent = `${Math.round(AppState.training.progress)}%`;
+        
+        // Update metrics
+        DOM.currentEpoch.textContent = `${AppState.training.currentEpoch}/${AppState.training.totalEpochs}`;
+        DOM.currentLoss.textContent = Utils.formatNumber(AppState.training.currentLoss);
+        DOM.currentIoU.textContent = Utils.formatNumber(AppState.training.currentIoU, 3);
+        DOM.bestIoU.textContent = Utils.formatNumber(AppState.training.bestIoU, 3);
+        
+        // Update training logs
+        this.updateTrainingLogs();
+        
+        // Update buttons
+        DOM.startTrainingBtn.disabled = AppState.training.isTraining;
+        DOM.stopTrainingBtn.style.display = AppState.training.isTraining ? 'block' : 'none';
+        
+        // Update status indicator
+        if (AppState.training.isTraining) {
+            Utils.updateStatusIndicator(DOM.trainingStatus, 'training', 'Training');
+            DOM.trainingProgress.style.display = 'block';
+        } else if (AppState.training.currentEpoch > 0) {
+            Utils.updateStatusIndicator(DOM.trainingStatus, 'completed', 'Completed');
+            DOM.trainingProgress.style.display = 'block';
+        } else {
+            Utils.updateStatusIndicator(DOM.trainingStatus, 'idle', 'Idle');
+            DOM.trainingProgress.style.display = 'none';
+        }
+    },
+    
+    updateTrainingLogs() {
+        DOM.trainingLogs.innerHTML = AppState.training.logs
+            .map(log => `<div class="log-entry info">${log}</div>`)
+            .join('');
+        
+        // Scroll to bottom
+        DOM.trainingLogs.scrollTop = DOM.trainingLogs.scrollHeight;
+    },
+    
+    async startTraining() {
+        try {
+            // Get form values
+            const formData = new FormData(DOM.trainingForm);
+            const params = {
+                epochs: parseInt(formData.get('epochs')) || 20,
+                batch_size: parseInt(formData.get('batch_size')) || 4,
+                learning_rate: parseFloat(formData.get('learning_rate')) || 0.001
+            };
+            
+            Utils.addLog(`Starting training with params: ${JSON.stringify(params)}`);
+            
+            const result = await ApiService.startTraining(params);
+            
+            if (result.success) {
+                Utils.showNotification('Training started successfully!', 'success');
+                Utils.addLog('Training started', 'success');
+            } else {
+                Utils.showNotification(`Failed to start training: ${result.message}`, 'error');
+                Utils.addLog(`Training start failed: ${result.message}`, 'error');
+            }
+        } catch (error) {
+            Utils.showNotification(`Error starting training: ${error.message}`, 'error');
+            Utils.addLog(`Training start error: ${error.message}`, 'error');
+        }
+    },
+    
+    async stopTraining() {
+        try {
+            Utils.addLog('Stopping training...');
+            
+            const result = await ApiService.stopTraining();
+            
+            if (result.success) {
+                Utils.showNotification('Training stopped', 'info');
+                Utils.addLog('Training stopped', 'info');
+            } else {
+                Utils.showNotification(`Failed to stop training: ${result.message}`, 'error');
+                Utils.addLog(`Failed to stop training: ${result.message}`, 'error');
+            }
+        } catch (error) {
+            Utils.showNotification(`Error stopping training: ${error.message}`, 'error');
+            Utils.addLog(`Error stopping training: ${error.message}`, 'error');
+        }
+    },
+    
+    startPolling() {
+        // Clear existing interval
+        if (this.pollingInterval) {
+            clearInterval(this.pollingInterval);
+        }
+        
+        // Poll every 2 seconds
+        this.pollingInterval = setInterval(async () => {
+            try {
+                const data = await ApiService.getTrainingStatus();
+                this.updateTrainingState(data);
+            } catch (error) {
+                // Silently handle polling errors
+                console.debug('Polling error:', error.message);
+            }
+        }, 2000);
+    },
+    
+    stopPolling() {
+        if (this.pollingInterval) {
+            clearInterval(this.pollingInterval);
+            this.pollingInterval = null;
+        }
+    }
+};
+
+// Prediction Module
+const PredictionModule = {
+    init() {
+        // Setup image upload
+        DOM.imageUpload?.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                this.previewImage(file);
+            }
+        });
+        
+        // Setup predict button
+        DOM.predictBtn?.addEventListener('click', () => {
+            this.predict();
+        });
+        
+        // Setup drag and drop
+        this.setupDragAndDrop();
+    },
+    
+    setupDragAndDrop() {
+        const uploadArea = DOM.imageUpload?.parentElement;
+        
+        if (!uploadArea) return;
+        
+        // Add drag and drop events
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        });
+        
+        // Highlight on drag
+        ['dragenter', 'dragover'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, () => {
+                uploadArea.classList.add('drag-over');
+            });
+        });
+        
+        // Remove highlight
+        ['dragleave', 'drop'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, () => {
+                uploadArea.classList.remove('drag-over');
+            });
+        });
+        
+        // Handle drop
+        uploadArea.addEventListener('drop', (e) => {
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                DOM.imageUpload.files = files;
+                this.previewImage(files[0]);
+            }
+        });
+    },
+    
+    previewImage(file) {
+        if (!file.type.match('image.*')) {
+            Utils.showNotification('Please select an image file', 'error');
+            return;
+        }
+        
+        const reader = new FileReader();
+        
+        reader.onload = (e) => {
+            DOM.originalImage.src = e.target.result;
+            DOM.predictionResults.style.display = 'none';
+            DOM.predictBtn.disabled = false;
+        };
+        
+        reader.readAsDataURL(file);
+    },
+    
+    async predict() {
+        const file = DOM.imageUpload.files[0];
+        
+        if (!file) {
+            Utils.showNotification('Please select an image first', 'error');
+            return;
+        }
+        
+        try {
+            // Disable predict button
+            DOM.predictBtn.disabled = true;
+            DOM.predictBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+            
+            Utils.addLog(`Making prediction for: ${file.name}`);
+            
+            const result = await ApiService.predict(file);
+            
+            if (result.success) {
+                // Update result images
+                DOM.segmentedImage.src = result.segmentation;
+                DOM.blendedImage.src = result.blended;
+                
+                // Update detected classes
+                DOM.detectedClasses.innerHTML = result.class_names
+                    .map((name, idx) => `
+                        <span class="class-tag">
+                            ${name}
+                        </span>
+                    `).join('');
+                
+                // Show results
+                DOM.predictionResults.style.display = 'block';
+                
+                Utils.showNotification('Prediction completed successfully!', 'success');
+                Utils.addLog(`Prediction completed. Detected: ${result.class_names.join(', ')}`, 'success');
+            } else {
+                Utils.showNotification(`Prediction failed: ${result.message}`, 'error');
+                Utils.addLog(`Prediction failed: ${result.message}`, 'error');
+            }
+        } catch (error) {
+            Utils.showNotification(`Error during prediction: ${error.message}`, 'error');
+            Utils.addLog(`Prediction error: ${error.message}`, 'error');
+        } finally {
+            // Re-enable predict button
+            DOM.predictBtn.disabled = false;
+            DOM.predictBtn.innerHTML = '<i class="fas fa-magic"></i> Predict';
+        }
+    }
+};
+
+// Model Module
+const ModelModule = {
+    async loadAvailableModels() {
+        try {
+            const data = await ApiService.listModels();
+            
+            if (data.success && data.models.length > 0) {
+                AppState.model.loaded = true;
+                AppState.model.name = data.models[0].name;
+                
+                Utils.updateStatusIndicator(DOM.modelStatus, 'completed', 'Loaded');
+                Utils.addLog(`Model loaded: ${AppState.model.name}`, 'success');
+            } else {
+                Utils.updateStatusIndicator(DOM.modelStatus, 'idle', 'Not Loaded');
+                Utils.addLog('No trained models found', 'warning');
+            }
+        } catch (error) {
+            Utils.updateStatusIndicator(DOM.modelStatus, 'error', 'Error');
+            Utils.addLog(`Failed to load models: ${error.message}`, 'error');
+        }
+    },
+    
+    async loadModel(modelPath) {
+        try {
+            Utils.addLog(`Loading model: ${modelPath}`);
+            
+            const result = await ApiService.loadModel(modelPath);
+            
+            if (result.success) {
+                Utils.showNotification('Model loaded successfully!', 'success');
+                Utils.addLog('Model loaded', 'success');
+                
+                // Update model state
+                AppState.model.loaded = true;
+                AppState.model.name = modelPath;
+                
+                Utils.updateStatusIndicator(DOM.modelStatus, 'completed', 'Loaded');
+            } else {
+                Utils.showNotification(`Failed to load model: ${result.message}`, 'error');
+                Utils.addLog(`Model load failed: ${result.message}`, 'error');
+            }
+        } catch (error) {
+            Utils.showNotification(`Error loading model: ${error.message}`, 'error');
+            Utils.addLog(`Model load error: ${error.message}`, 'error');
+        }
+    }
+};
+
+// Application initialization
+document.addEventListener('DOMContentLoaded', async () => {
+    Utils.addLog('Application starting...', 'info');
+    
+    try {
+        // Initialize modules
+        await DatasetModule.loadDatasetInfo();
+        TrainingModule.init();
+        PredictionModule.init();
+        await ModelModule.loadAvailableModels();
+        
+        // Check system health
+        const health = await ApiService.healthCheck();
+        Utils.addLog(`System health: ${health.status}`, 'success');
+        
+        // Show welcome message
+        setTimeout(() => {
+            Utils.showNotification('Semantic Segmentation Web Application Ready!', 'success');
+            Utils.addLog('Application ready', 'success');
+        }, 1000);
+        
+    } catch (error) {
+        Utils.addLog(`Application initialization failed: ${error.message}`, 'error');
+        Utils.showNotification('Failed to initialize application. Please check console.', 'error');
+    }
+});
+
+// Global error handler
+window.addEventListener('error', (event) => {
+    Utils.addLog(`Unhandled error: ${event.message}`, 'error');
+    console.error('Unhandled error:', event.error);
+});
+
+// Cleanup on page unload
+window.addEventListener('beforeunload', () => {
+    TrainingModule.stopPolling();
+});<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Segmentation - Pascal VOC 2012</title>
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>
+                <i class="fas fa-robot"></i>
+                Semantic Segmentation Web Application
+            </h1>
+            <p>Train and test semantic segmentation models using the Pascal VOC 2012 dataset</p>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="status-label">Dataset:</span>
+                    <span id="dataset-status" class="status-indicator status-idle">
+                        <i class="fas fa-circle"></i>
+                        <span>Loading...</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Model:</span>
+                    <span id="model-status" class="status-indicator status-idle">
+                        <i class="fas fa-circle"></i>
+                        <span>Loading...</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Training:</span>
+                    <span id="training-status" class="status-indicator status-idle">
+                        <i class="fas fa-circle"></i>
+                        <span>Idle</span>
+                    </span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Dashboard -->
+        <div class="dashboard">
+            <!-- Dataset Information Card -->
+            <div class="card">
+                <h2><i class="fas fa-database"></i> Dataset Information</h2>
+                <div id="dataset-info">
+                    <div class="loading">
+                        <i class="fas fa-spinner fa-spin"></i>
+                        <span>Loading dataset information...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Training Card -->
+            <div class="card">
+                <h2><i class="fas fa-cogs"></i> Model Training</h2>
+                
+                <form id="training-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="epochs">
+                                <i class="fas fa-redo"></i> Epochs
+                            </label>
+                            <input type="number" id="epochs" name="epochs" min="1" max="100" value="20" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="batch_size">
+                                <i class="fas fa-layer-group"></i> Batch Size
+                            </label>
+                            <input type="number" id="batch_size" name="batch_size" min="1" max="32" value="4" required>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="learning_rate">
+                            <i class="fas fa-tachometer-alt"></i> Learning Rate
+                        </label>
+                        <input type="number" id="learning_rate" name="learning_rate" min="0.00001" max="0.1" step="0.0001" value="0.001" required>
+                    </div>
+                    
+                    <button type="submit" id="start-training-btn" class="btn btn-primary btn-block">
+                        <i class="fas fa-play"></i> Start Training
+                    </button>
+                    
+                    <button type="button" id="stop-training-btn" class="btn btn-danger btn-block" style="display: none; margin-top: 10px;">
+                        <i class="fas fa-stop"></i> Stop Training
+                    </button>
+                </form>
+                
+                <!-- Training Progress -->
+                <div id="training-progress" style="display: none;">
+                    <h3><i class="fas fa-chart-line"></i> Training Progress</h3>
+                    
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div id="progress-fill" class="progress-fill"></div>
+                        </div>
+                        <div class="progress-text">
+                            <span>Progress</span>
+                            <span id="progress-text">0%</span>
+                        </div>
+                    </div>
+                    
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <div class="metric-value" id="current-epoch">0/0</div>
+                            <div class="metric-label">Epoch</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="current-loss">0.0000</div>
+                            <div class="metric-label">Loss</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="current-iou">0.000</div>
+                            <div class="metric-label">IoU</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="best-iou">0.000</div>
+                            <div class="metric-label">Best IoU</div>
+                        </div>
+                    </div>
+                    
+                    <div class="logs-container">
+                        <div class="logs-header">
+                            <h4><i class="fas fa-terminal"></i> Training Logs</h4>
+                            <button class="btn btn-secondary btn-sm" onclick="document.getElementById('training-logs').innerHTML = ''">
+                                <i class="fas fa-trash"></i> Clear
+                            </button>
+                        </div>
+                        <div id="training-logs" class="logs"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Prediction Card -->
+            <div class="card">
+                <h2><i class="fas fa-magic"></i> Image Prediction</h2>
+                
+                <div class="image-upload">
+                    <input type="file" id="image-upload" accept="image/*" style="display: none;">
+                    <div onclick="document.getElementById('image-upload').click()">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <p>Click to upload or drag and drop</p>
+                        <p class="text-muted">Supports JPG, PNG, BMP (Max 10MB)</p>
+                    </div>
+                </div>
+                
+                <button id="predict-btn" class="btn btn-success btn-block" disabled>
+                    <i class="fas fa-magic"></i> Predict Segmentation
+                </button>
+                
+                <!-- Prediction Results -->
+                <div id="prediction-results" style="display: none; margin-top: 25px;">
+                    <h3><i class="fas fa-images"></i> Results</h3>
+                    
+                    <div class="image-comparison">
+                        <div class="image-container">
+                            <h4>Original Image</h4>
+                            <img id="original-image" class="result-image" src="" alt="Original">
+                        </div>
+                        <div class="image-container">
+                            <h4>Segmentation</h4>
+                            <img id="segmented-image" class="result-image" src="" alt="Segmentation">
+                        </div>
+                        <div class="image-container">
+                            <h4>Blended Result</h4>
+                            <img id="blended-image" class="result-image" src="" alt="Blended">
+                        </div>
+                    </div>
+                    
+                    <div class="detected-classes">
+                        <h4><i class="fas fa-tags"></i> Detected Classes</h4>
+                        <div id="detected-classes" class="classes-grid"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Logs -->
+        <div class="card">
+            <div class="logs-header">
+                <h2><i class="fas fa-clipboard-list"></i> System Logs</h2>
+                <button class="btn btn-secondary btn-sm" onclick="document.getElementById('system-logs').innerHTML = ''">
+                    <i class="fas fa-trash"></i> Clear
+                </button>
+            </div>
+            <div id="system-logs" class="logs"></div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>
+                <i class="fas fa-code"></i> Semantic Segmentation Web Application
+                &nbsp;|&nbsp;
+                <i class="fas fa-database"></i> Pascal VOC 2012 Dataset
+                &nbsp;|&nbsp;
+                <i class="fas fa-brain"></i> PyTorch + Flask
+            </p>
+            <p>
+                <small>
+                    For educational and research purposes. 
+                    <a href="https://www.kaggle.com/datasets/gopalbhattrai/pascal-voc-2012-dataset" target="_blank">
+                        <i class="fas fa-external-link-alt"></i> Dataset Source
+                    </a>
+                </small>
+            </p>
+        </footer>
+    </div>
+
+    <!-- JavaScript -->
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

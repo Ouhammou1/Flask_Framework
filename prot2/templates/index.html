@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Segmentation - Pascal VOC 2012</title>
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>
+                <i class="fas fa-robot"></i>
+                Semantic Segmentation Web Application
+            </h1>
+            <p>Train and test semantic segmentation models using the Pascal VOC 2012 dataset</p>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="status-label">Dataset:</span>
+                    <span id="dataset-status" class="status-indicator status-idle">
+                        <i class="fas fa-circle"></i>
+                        <span>Loading...</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Model:</span>
+                    <span id="model-status" class="status-indicator status-idle">
+                        <i class="fas fa-circle"></i>
+                        <span>Loading...</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Training:</span>
+                    <span id="training-status" class="status-indicator status-idle">
+                        <i class="fas fa-circle"></i>
+                        <span>Idle</span>
+                    </span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Dashboard -->
+        <div class="dashboard">
+            <!-- Dataset Information Card -->
+            <div class="card">
+                <h2><i class="fas fa-database"></i> Dataset Information</h2>
+                <div id="dataset-info">
+                    <div class="loading">
+                        <i class="fas fa-spinner fa-spin"></i>
+                        <span>Loading dataset information...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Training Card -->
+            <div class="card">
+                <h2><i class="fas fa-cogs"></i> Model Training</h2>
+                
+                <form id="training-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="epochs">
+                                <i class="fas fa-redo"></i> Epochs
+                            </label>
+                            <input type="number" id="epochs" name="epochs" min="1" max="100" value="20" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="batch_size">
+                                <i class="fas fa-layer-group"></i> Batch Size
+                            </label>
+                            <input type="number" id="batch_size" name="batch_size" min="1" max="32" value="4" required>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="learning_rate">
+                            <i class="fas fa-tachometer-alt"></i> Learning Rate
+                        </label>
+                        <input type="number" id="learning_rate" name="learning_rate" min="0.00001" max="0.1" step="0.0001" value="0.001" required>
+                    </div>
+                    
+                    <button type="submit" id="start-training-btn" class="btn btn-primary btn-block">
+                        <i class="fas fa-play"></i> Start Training
+                    </button>
+                    
+                    <button type="button" id="stop-training-btn" class="btn btn-danger btn-block" style="display: none; margin-top: 10px;">
+                        <i class="fas fa-stop"></i> Stop Training
+                    </button>
+                </form>
+                
+                <!-- Training Progress -->
+                <div id="training-progress" style="display: none;">
+                    <h3><i class="fas fa-chart-line"></i> Training Progress</h3>
+                    
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div id="progress-fill" class="progress-fill"></div>
+                        </div>
+                        <div class="progress-text">
+                            <span>Progress</span>
+                            <span id="progress-text">0%</span>
+                        </div>
+                    </div>
+                    
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <div class="metric-value" id="current-epoch">0/0</div>
+                            <div class="metric-label">Epoch</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="current-loss">0.0000</div>
+                            <div class="metric-label">Loss</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="current-iou">0.000</div>
+                            <div class="metric-label">IoU</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="best-iou">0.000</div>
+                            <div class="metric-label">Best IoU</div>
+                        </div>
+                    </div>
+                    
+                    <div class="logs-container">
+                        <div class="logs-header">
+                            <h4><i class="fas fa-terminal"></i> Training Logs</h4>
+                            <button class="btn btn-secondary btn-sm" onclick="document.getElementById('training-logs').innerHTML = ''">
+                                <i class="fas fa-trash"></i> Clear
+                            </button>
+                        </div>
+                        <div id="training-logs" class="logs"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Prediction Card -->
+            <div class="card">
+                <h2><i class="fas fa-magic"></i> Image Prediction</h2>
+                
+                <div class="image-upload">
+                    <input type="file" id="image-upload" accept="image/*" style="display: none;">
+                    <div onclick="document.getElementById('image-upload').click()">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <p>Click to upload or drag and drop</p>
+                        <p class="text-muted">Supports JPG, PNG, BMP (Max 10MB)</p>
+                    </div>
+                </div>
+                
+                <button id="predict-btn" class="btn btn-success btn-block" disabled>
+                    <i class="fas fa-magic"></i> Predict Segmentation
+                </button>
+                
+                <!-- Prediction Results -->
+                <div id="prediction-results" style="display: none; margin-top: 25px;">
+                    <h3><i class="fas fa-images"></i> Results</h3>
+                    
+                    <div class="image-comparison">
+                        <div class="image-container">
+                            <h4>Original Image</h4>
+                            <img id="original-image" class="result-image" src="" alt="Original">
+                        </div>
+                        <div class="image-container">
+                            <h4>Segmentation</h4>
+                            <img id="segmented-image" class="result-image" src="" alt="Segmentation">
+                        </div>
+                        <div class="image-container">
+                            <h4>Blended Result</h4>
+                            <img id="blended-image" class="result-image" src="" alt="Blended">
+                        </div>
+                    </div>
+                    
+                    <div class="detected-classes">
+                        <h4><i class="fas fa-tags"></i> Detected Classes</h4>
+                        <div id="detected-classes" class="classes-grid"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Logs -->
+        <div class="card">
+            <div class="logs-header">
+                <h2><i class="fas fa-clipboard-list"></i> System Logs</h2>
+                <button class="btn btn-secondary btn-sm" onclick="document.getElementById('system-logs').innerHTML = ''">
+                    <i class="fas fa-trash"></i> Clear
+                </button>
+            </div>
+            <div id="system-logs" class="logs"></div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>
+                <i class="fas fa-code"></i> Semantic Segmentation Web Application
+                &nbsp;|&nbsp;
+                <i class="fas fa-database"></i> Pascal VOC 2012 Dataset
+                &nbsp;|&nbsp;
+                <i class="fas fa-brain"></i> PyTorch + Flask
+            </p>
+            <p>
+                <small>
+                    For educational and research purposes. 
+                    <a href="https://www.kaggle.com/datasets/gopalbhattrai/pascal-voc-2012-dataset" target="_blank">
+                        <i class="fas fa-external-link-alt"></i> Dataset Source
+                    </a>
+                </small>
+            </p>
+        </footer>
+    </div>
+
+    <!-- JavaScript -->
+    <script src="/static/js/main.js"></script>
+</body>
+</html>

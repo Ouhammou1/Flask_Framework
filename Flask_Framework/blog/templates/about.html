@@ -1,15 +1,8 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- <title>About</title> -->
+{% extends 'base.html' %}
 
-    {% if title %}
-        <title>Blog - {{title}} </title>
-    {% else  %}
-        <title>Blog</title>
-    {% endif %}
+{% block content  %}
+    
+
 
     <style>
         body {
@@ -41,8 +34,11 @@
 <header>
     <h1>About Us</h1>
     <nav>
-        <a href="home.html">Home</a>
-        <a href="about.html">About</a>
+        <!-- <a href="home.html">Home</a>
+        <a href="about.html">About</a> -->
+        <a href="{{ url_for('home') }}">Home</a>
+        <a href="{{ url_for('about') }}">About</a>
+
     </nav>
 </header>
 
@@ -53,6 +49,4 @@
         the author, or the purpose of the project.
     </p>
 </div>
-
-</body>
-</html>
+{% endblock %}

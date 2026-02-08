@@ -22,6 +22,18 @@
     </header>
 
     <main class="container my-4">
+        
+        {% with message= get_flashed_messages(with_categories=true)  %}
+        {% if message %}
+            {% for category , msg in message %}
+            <div class="alert alert-{{ category }}" role="alert">
+                {{ msg }}
+              </div>
+            {% endfor %}
+        {% endif %}    
+
+        {% endwith %}
+
         {% block content %}
         {% endblock  %}
 

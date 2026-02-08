@@ -46,7 +46,7 @@ def about():
 def register():
     form = RegisterForm()
     if form.validate_on_submit():
-        flash(f"{form.username.data} Registered Successfully" , "succes")
+        flash(f"{form.username.data} Registered Successfully" , "success")
         return redirect(url_for('home'))
 
     return render_template('register.html', form=form  , title="Register")
@@ -57,5 +57,4 @@ if __name__ == "__main__":
     app.run(debug=True)
 
 
-
-#28:17
+# vedio 4 
